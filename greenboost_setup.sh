@@ -1205,14 +1205,16 @@ cmd_full_install() {
     chmod -R 755 /opt/greenboost
 
     # Install ExLlamaV3 from bundled library.
-    # Do NOT use --no-build-isolation: pip needs to manage the maturin build
-    # environment for pydantic-core and other Rust-based transitive deps.
+    # --no-build-isolation is required so that flash_attn's setup.py can import
+    # torch at build time (torch is in the venv but not in pip's isolated sandbox).
+    # maturin is also in the venv (installed above), so pydantic-core builds fine.
     if [[ -d "$exllama_dir" ]]; then
         info "Installing ExLlamaV3 from $exllama_dir ..."
         warn "This may take 10-30 min on first run (flash-attn CUDA compilation)."
         STLOADER_USE_URING=1 "$venv_dir/bin/python" -m pip install -e "$exllama_dir" \
+            --no-build-isolation \
             && info "ExLlamaV3 installed." \
-            || warn "ExLlamaV3 install failed — re-run: STLOADER_USE_URING=1 $venv_dir/bin/python -m pip install -e $exllama_dir"
+            || warn "ExLlamaV3 install failed — re-run: STLOADER_USE_URING=1 $venv_dir/bin/python -m pip install -e $exllama_dir --no-build-isolation"
     else
         warn "ExLlamaV3 not found at $exllama_dir — skipping."
     fi
