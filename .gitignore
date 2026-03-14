@@ -21,6 +21,7 @@ nano.*.save
 
 # Private Claude Code context
 .claude/
+CLAUDE.md
 
 # Python
 __pycache__/

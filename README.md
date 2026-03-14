@@ -238,9 +238,6 @@ plan.md                   — integration plan and implementation status
 GPL v2 — open-source. Attribution to Ferran Duarri is required in all forks, derivatives,
 and any documentation that references this work.
 
-A commercial license is available for proprietary products or integrations that cannot
-comply with GPL v2. Contact information is in the repository.
-
 ```
 Copyright (C) 2024-2026 Ferran Duarri
 ```
