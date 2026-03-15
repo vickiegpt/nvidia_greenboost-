@@ -1147,6 +1147,16 @@ cmd_setup_swap() {
 cmd_full_install() {
     need_root full-install
 
+    # ── Distro detection: delegate to Rocky/RHEL script on Red Hat-based systems ──
+    if [[ -f /etc/redhat-release ]] || \
+       grep -qiE '^ID_LIKE=.*rhel|^ID_LIKE=.*fedora|^ID=.*rhel|^ID=.*rocky|^ID=.*almalinux|^ID=.*centos|^ID=.*fedora' \
+           /etc/os-release 2>/dev/null; then
+        local rocky_script="$MODULE_DIR/greenboost_setup_rocky.sh"
+        [[ -x "$rocky_script" ]] || die "Red Hat-based system detected but $rocky_script not found or not executable."
+        info "Red Hat-based system detected — delegating to greenboost_setup_rocky.sh"
+        exec "$rocky_script" full-install "$@"
+    fi
+
     # ── Hardware preset: --owner-workstation overrides auto-detection ────
     local _owner_ws=0
     for arg in "$@"; do
