@@ -50,11 +50,16 @@
 #include <asm/processor.h>        /* boot_cpu_data.x86_model_id       */
 #include "greenboost_ioctl.h"
 
+// Needed for Red Hat 5.14 and 5.16+ kernels
+// See for example https://github.com/google/gasket-driver/issues/14
+#if __has_include(<linux/dma-buf.h>)
+MODULE_IMPORT_NS("DMA_BUF");
+#endif
+
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Ferran Duarri");
 MODULE_DESCRIPTION("GreenBoost v2.3 — 3-tier pool: RTX5070 VRAM + DDR4 + NVMe swap");
 MODULE_VERSION("2.3.0");
-MODULE_IMPORT_NS("DMA_BUF");
 
 /* 2 MiB hugepage constants */
 #define GB_HPAGE_ORDER  9u
