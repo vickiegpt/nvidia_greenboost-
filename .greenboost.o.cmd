@@ -1394,6 +1394,8 @@ deps_greenboost.o := \
   /usr/src/linux-headers-6.19.0-9-generic/include/linux/pagemap.h \
   /usr/src/linux-headers-6.19.0-9-generic/include/linux/hugetlb_inline.h \
   /usr/src/linux-headers-6.19.0-9-generic/include/uapi/linux/mempolicy.h \
+  /usr/src/linux-headers-6.19.0-9-generic/include/linux/dmi.h \
+    $(wildcard include/config/DMI) \
   greenboost_ioctl.h \
 
 greenboost.o: $(deps_greenboost.o)
