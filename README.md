@@ -238,6 +238,8 @@ COMMANDS:
 
 ```
 
+** Greenboost_setup.sh had been adapted to detect if installation happens under RedHat based system and execute Alan's script. 
+
 ---
 
 ## License
