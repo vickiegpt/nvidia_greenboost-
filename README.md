@@ -254,3 +254,10 @@ Copyright (C) 2024-2026 Ferran Duarri
 If you try this and run into issues, open an issue on the repository. I am particularly
 interested in feedback from people running different GPU generations (Ada Lovelace, Ampere)
 or different inference engines beyond Ollama and ExLlamaV3.
+
+---
+
+## Contributors
+
+- **Alan Sill** ([@alansill](https://gitlab.com/alansill)) — contributed `greenboost_setup_rocky.sh`,
+  a setup script for Red Hat-based systems (Rocky Linux, AlmaLinux, RHEL).

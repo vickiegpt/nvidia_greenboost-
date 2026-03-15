@@ -58,7 +58,7 @@ MODULE_IMPORT_NS("DMA_BUF");
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Ferran Duarri");
-MODULE_DESCRIPTION("GreenBoost v2.3 — 3-tier pool: RTX5070 VRAM + DDR4 + NVMe swap");
+MODULE_DESCRIPTION("GreenBoost v2.3 — 3-tier pool: NVidia RTX GPU VRAM + System DDR RAM + NVMe swap");
 MODULE_VERSION("2.3.0");
 
 /* 2 MiB hugepage constants */
