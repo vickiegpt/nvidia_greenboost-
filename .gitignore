@@ -19,9 +19,18 @@ nano.*.save
 *.swo
 *~
 
+# Claude residual files
+*plan.md
+plan*.md
+apply_fixes.sh
+
 # Private Claude Code context
 .claude/
 CLAUDE.md
+MEMORY.md
+memory/
+*.claude.md
+.claude_*
 
 # Python
 __pycache__/

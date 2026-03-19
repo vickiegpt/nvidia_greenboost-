@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Copyright (C) 2024-2026 Ferran Duarri. Dual-licensed: GPL v2 + Commercial.
- * GreenBoost v2.3 — Shared IOCTL definitions (kernel + userspace)
+ * GreenBoost v2.4 — Shared IOCTL definitions (kernel + userspace)
  *
  * Works with both #include <linux/ioctl.h> (kernel) and <sys/ioctl.h> (user).
  *
@@ -31,7 +31,7 @@
 #define GB_ALLOC_FROZEN      (1u << 3)  /* never evict from T2              */
 #define GB_ALLOC_NO_HUGEPAGE (1u << 4)  /* force 4K (for T3-spillable)      */
 
-/* Allocate a pinned DDR4 buffer; returns a DMA-BUF fd the GPU can import */
+/* Allocate a pinned system RAM buffer; returns a DMA-BUF fd the GPU can import */
 struct gb_alloc_req {
 	gb_u64 size;    /* bytes to allocate          (in)  */
 	gb_s32 fd;      /* DMA-BUF fd returned        (out) */
@@ -43,7 +43,7 @@ struct gb_info {
 	/* Tier 1 — GPU VRAM (physical, managed by NVIDIA driver) */
 	gb_u64 vram_physical_mb;   /* RTX 5070 physical VRAM             */
 
-	/* Tier 2 — DDR4 RAM pool (pinned pages, DMA-BUF exported) */
+	/* Tier 2 — system RAM pool (pinned pages, DMA-BUF exported) */
 	gb_u64 total_ram_mb;       /* total system RAM                   */
 	gb_u64 free_ram_mb;        /* currently free RAM                 */
 	gb_u64 allocated_mb;       /* bytes pinned by GreenBoost (T2)    */

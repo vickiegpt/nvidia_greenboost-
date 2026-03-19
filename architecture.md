@@ -1,6 +1,6 @@
 # GreenBoost — Architecture Reference
 **Author:** Ferran Duarri
-**Version:** 2.3
+**Version:** 2.5
 **License:** GPL v2 (open-source) / Commercial (contact author)
 **Kernel:** Linux 6.19 | **GPU:** NVIDIA RTX 5070 (GB205, Blackwell) | **CUDA:** 13
 
@@ -12,7 +12,7 @@ Running `glm-4.7-flash:q8_0` (31.8 GB, 30B parameters, 198K context) on a workst
 12 GB GPU VRAM requires transparent memory extension. GreenBoost creates a 3-tier virtual
 GPU memory pool that CUDA applications use automatically, without any code changes.
 
-Total addressable memory: **T1 (12 GB) + T2 (51 GB) + T3 (64 GB) = 127 GB**
+Total addressable memory: **T1 (12 GB) + T2 (51 GB) + T3 (auto-sized, ~128 GB default) ≈ 191 GB**
 
 ---
 
@@ -22,11 +22,18 @@ Total addressable memory: **T1 (12 GB) + T2 (51 GB) + T3 (64 GB) = 127 GB**
 |------|--------|----------|-----------|---------|------|
 | **T1** | RTX 5070 GDDR7 | 12 GB | ~336 GB/s | ~100 ns | Hot layers — native GPU compute |
 | **T2** | DDR4-3600 pool | 51 GB | ~57.6 GB/s local / ~32 GB/s via PCIe 4.0 | ~50 ns | Cold layers — pinned DMA-BUF pages |
-| **T3** | NVMe swap | 64 GB | ~1.8 GB/s | ~100 µs | Frozen pages — kernel swap subsystem |
+| **T3** | NVMe swap | auto-sized | ~1.8 GB/s | ~100 µs | Frozen pages — kernel swap subsystem |
 
 **Design principle:** A 30B model's active layer fits in T1. The rest of the KV cache and
 cold weight tensors live in T2 over PCIe 4.0 x16 (~32 GB/s DMA bandwidth). T3 is a safety
 net — it is rarely touched during normal inference.
+
+**T3 sizing:** `full-install` auto-sizes T3 as `2×(T1+T2)`, floored at 64 GB and capped at
+200 GB (also capped at 25% of NVMe capacity to avoid hogging the drive). For the reference
+hardware (12+51 GB pool, largest model nemotron-3-super:120b ≈ 87 GB, 256K context):
+- Weight overflow: 87 − 63 = 24 GB
+- KV cache at 256K context: ~40–50 GB
+- Worst-case T3 need: ~64–74 GB → formula yields 128 GB, giving ~2× headroom.
 
 ---
 
@@ -40,7 +47,7 @@ net — it is rarely touched during normal inference.
                               │  LD_PRELOAD intercept
                               ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│              libgreenboost_cuda.so  (CUDA shim v2.3)               │
+│              libgreenboost_cuda.so  (CUDA shim v2.4)               │
 │  • Intercepts: cudaMalloc, cudaMallocAsync, cuMemAllocAsync,       │
 │                cudaFree, cuMemFree, dlsym                           │
 │  • Hooks: cuDeviceTotalMem_v2, nvmlDeviceGetMemoryInfo             │
@@ -53,7 +60,7 @@ net — it is rarely touched during normal inference.
                               │  GB_IOCTL_ALLOC / GB_IOCTL_FREE
                               ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│              /dev/greenboost  (greenboost.ko v2.3)                  │
+│              /dev/greenboost  (greenboost.ko v2.4)                  │
 │  • Char device, IOCTL interface                                     │
 │  • GB_IOCTL_ALLOC    — allocate pinned DDR4 pages, return DMA-BUF │
 │  • GB_IOCTL_GET_INFO — pool statistics                             │
@@ -71,7 +78,7 @@ net — it is rarely touched during normal inference.
 ┌──────────────────┐  ┌───────────────────┐  ┌───────────────────────┐
 │  Tier 1: T1      │  │  Tier 2: T2        │  │  Tier 3: T3           │
 │  RTX 5070 VRAM   │  │  DDR4 pool         │  │  NVMe swap            │
-│  12 GB GDDR7     │◄─┤  51 GB pinned      │  │  64 GB (/swap_nvme)  │
+│  12 GB GDDR7     │◄─┤  51 GB pinned      │  │  auto-sized NVMe     │
 │  336 GB/s        │  │  2 MB hugepages    │  │  kernel swap handles  │
 │  Native CUDA     │  │  cudaImportExt.Mem │  │  eviction to NVMe     │
 └──────────────────┘  └───────────────────┘  └───────────────────────┘
@@ -114,8 +121,8 @@ compression is enabled system-wide via sysctl.
 | `physical_vram_gb` | 12 | RTX 5070 actual VRAM |
 | `virtual_vram_gb` | 51 | DDR4 pool capacity (T2) |
 | `safety_reserve_gb` | 12 | Min free RAM never touched |
-| `nvme_swap_gb` | 64 | T3 NVMe swap size (auto-detected on install) |
-| `nvme_pool_gb` | 58 | T3 soft cap |
+| `nvme_swap_gb` | auto | T3 NVMe swap size — computed as 2×(T1+T2), floor 64 GB, cap 200 GB |
+| `nvme_pool_gb` | auto | T3 soft cap (89% of nvme_swap_gb) |
 | `use_hugepages` | 1 | 2 MB compound pages for T2 |
 | `pcores_only` | 1 | Pin watchdog to P-cores |
 | `debug_mode` | 0 | Verbose dmesg output |
@@ -129,6 +136,19 @@ compression is enabled system-wide via sysctl.
 
 ## CUDA Shim — `greenboost_cuda_shim.c` → `libgreenboost_cuda.so`
 
+### Activation (two-stage RTLD_NOLOAD)
+
+The shim is loaded system-wide via `/etc/ld.so.preload` but stays inert in non-CUDA
+processes (GDM, shells, systemd helpers) through a two-stage constructor:
+
+- **Stage 1:** `dlopen("libcuda.so.1", RTLD_NOLOAD)` — probes whether libcuda is
+  already resident, zero side-effects. Processes without CUDA return NULL here and the
+  constructor exits immediately. Apps that link libcuda statically (llama.cpp,
+  TensorRT-LLM) activate automatically via this path.
+- **Stage 2:** If `GREENBOOST_ACTIVE=1` is set, the shim proceeds to load libcuda
+  actively. Used for apps that dlopen CUDA lazily at runtime (Ollama, vLLM, PyTorch).
+  Set automatically by the Ollama/llama-server systemd units and `greenboost-run`.
+
 ### Allocation Flow
 
 ```
@@ -136,11 +156,18 @@ cudaMalloc(size) called by Ollama/ExLlamaV3
     │
     ├─ size < 256 MB  → real_cudaMalloc() (pass-through)
     │
-    └─ size ≥ 256 MB  → open("/dev/greenboost")
-                         ioctl(GB_IOCTL_ALLOC, {size, GB_ALLOC_KV_CACHE})
-                         cudaImportExternalMemory(dma_buf_fd)
-                         cudaExternalMemoryGetMappedBuffer()
-                         → return devPtr (valid CUDA pointer to DDR4 pages)
+    └─ size ≥ 256 MB  → gb_needs_overflow() checks real free VRAM
+                         │
+                         ├─ Path 1 (DMA-BUF, primary):
+                         │    mmap anonymous pages → GB_IOCTL_PIN_USER_PTR
+                         │    cuMemHostRegister → cuMemHostGetDevicePointer
+                         │    → return devPtr (pinned DDR4, zero-copy over PCIe)
+                         │
+                         └─ Path 2 (UVM fallback):
+                              cuMemAllocManaged(CU_MEM_ATTACH_GLOBAL)
+                              cuMemAdvise(SET_PREFERRED_LOCATION, GPU)   ← eliminates
+                              cuMemAdvise(SET_ACCESSED_BY, GPU)          ← page-fault latency
+                              → ~50% throughput gain vs on-demand fault mode
 ```
 
 ### Virtual VRAM Reporting (dlsym hook)
@@ -150,7 +177,7 @@ Ollama uses `dlopen` + `dlsym` to resolve CUDA/NVML symbols at runtime. This byp
 
 ```c
 // Priority-101 constructor runs before gb_shim_init, bootstraps real dlsym:
-real_dlsym = dlvsym(RTLD_DEFAULT, "dlsym", "GLIBC_2.0");
+real_dlsym = dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");  // falls back to 2.2.5 / 2.0
 
 // Our dlsym override returns hooked pointers for key symbols:
 //   cuDeviceTotalMem_v2 → returns physical_vram + virtual_vram (63 GB)
@@ -314,7 +341,7 @@ watch -n1 'swapon --show'
 
 | Configuration | Tok/s (decode) | TTFT | Notes |
 |---------------|----------------|------|-------|
-| Ollama + GreenBoost shim | 2–5 | 5–15s | Baseline — PCIe 4.0 bound |
+| Ollama + GreenBoost shim (UVM path) | 3–8 | 4–12s | UVM prefetch hints active — ~50% vs fault mode |
 | + kvpress 50% compression | 4–8 | 3–10s | Less PCIe traffic |
 | + ExLlamaV3 + GreenBoost cache | 8–20 | 2–8s | Native DDR4 cache offload |
 | + ModelOpt FP8 → 16 GB | 10–25 | 1–5s | Model fits better in T1 |

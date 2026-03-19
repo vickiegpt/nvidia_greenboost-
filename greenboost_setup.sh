@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# GreenBoost v2.3 — Setup & installation script
+# GreenBoost v2.4 — Setup & installation script
 # Author: Ferran Duarri
 # Hardware: ASRock B760M-ITX/D4 | i9-14900KF | RTX 5070 OC | 64 GB DDR4-3600 | Samsung 990 EVO Plus 4 TB
 #
 # 3-tier memory hierarchy:
 #   Tier 1 — RTX 5070 VRAM      12 GB   ~336 GB/s GDDR7  (hot layers)
-#   Tier 2 — DDR4 pool          51 GB   ~57.6 GB/s dual-ch (cold layers)
+#   Tier 2 — System RAM pool    auto GB   ~57.6 GB/s dual-ch (cold layers)
 #   Tier 3 — NVMe swap          64 GB   ~7.25 GB/s seq     (frozen pages, auto-sized)
 #   Combined capacity           75 GB   (T3 expandable up to 200+ GB)
 #
@@ -14,7 +14,8 @@
 #   sudo ./greenboost_setup.sh uninstall        — remove module + all config
 #   sudo ./greenboost_setup.sh load             — insmod with default params
 #   sudo ./greenboost_setup.sh unload           — rmmod
-#   sudo ./greenboost_setup.sh install-sys-configs — install v2.3 system config files
+#   sudo ./greenboost_setup.sh install-sys-configs    — install v2.4 system config files
+#   sudo ./greenboost_setup.sh install-llama-configs  — transparent llama.cpp injection (ld.so.preload)
 #   sudo ./greenboost_setup.sh tune             — runtime tuning (governor, NVMe, sysctl)
 #   sudo ./greenboost_setup.sh tune-grub        — GRUB/boot parameter optimization
 #   sudo ./greenboost_setup.sh tune-sysctl      — consolidate + enhance sysctl (persistent)
@@ -27,7 +28,7 @@
 #
 # ENVIRONMENT (for load command):
 #   GPU_PHYS_GB=12     physical VRAM in GB       (RTX 5070 default)
-#   VIRT_VRAM_GB=51    DDR4 pool size in GB      (80% of 64 GB DDR4)
+#   VIRT_VRAM_GB=51    system RAM pool size in GB      (80% of 64 GB DDR4)
 #   RESERVE_GB=12      minimum free system RAM to always maintain
 #   NVME_SWAP_GB=64    total NVMe swap capacity  (auto-detected; 64 GB default)
 #   NVME_POOL_GB=58    GreenBoost soft cap on T3 allocations
@@ -138,17 +139,37 @@ detect_hardware() {
     [[ $NVME_SIZE_GB -eq 0 ]] && NVME_SIZE_GB=128  # fallback
 
     # ── NVMe swap sizing (T3) ─────────────────────────────────────────────
-    # Goal: enough swap as overflow safety net.
-    # For glm-4.7-flash:q8_0 (32GB model): T1+T2 covers it; 64GB is generous.
-    # General formula: 4×VRAM but at least 32 GB and at most 200 GB.
-    GB_NVME_SWAP=$(( GB_PHYS * 4 ))
-    [[ $GB_NVME_SWAP -lt 32  ]] && GB_NVME_SWAP=32
-    [[ $GB_NVME_SWAP -gt 200 ]] && GB_NVME_SWAP=200
-    # Never allocate more than half the NVMe drive
-    local half_nvme=$(( NVME_SIZE_GB / 2 ))
-    [[ $GB_NVME_SWAP -gt $half_nvme && $half_nvme -gt 32 ]] && GB_NVME_SWAP=$half_nvme
+    # Goal: reflect the actual NVMe swap available so the greenboost watchdog
+    # reports correct pressure levels (not CRITICAL after only 4×VRAM GB).
+    # Strategy: read the actual swap file/partition size from /proc/swaps,
+    # sum up NVMe-backed swap entries; fall back to 60% of drive if not found.
+    local nvme_swap_detected=0
+    local swapfile swapsize_kb backing_dev
+    while read -r swapfile _ _ swapsize_kb _; do
+        [[ "$swapfile" == "Filename" ]] && continue  # skip header
+        local sw_gb=$(( swapsize_kb / 1024 / 1024 ))
+        backing_dev=$(df --output=source "$swapfile" 2>/dev/null | tail -1)
+        if [[ "$backing_dev" == /dev/nvme* || "$backing_dev" == /dev/mapper/* ]]; then
+            (( nvme_swap_detected += sw_gb )) || true
+        fi
+    done < /proc/swaps
 
-    GB_NVME_POOL=$(( GB_NVME_SWAP * 9 / 10 ))
+    if [[ $nvme_swap_detected -gt 32 ]]; then
+        GB_NVME_SWAP=$nvme_swap_detected
+    else
+        # Size T3 to cover 2× the combined T1+T2 pool — enough headroom for any
+        # model up to 2× pool size (e.g. 120B q8_0 on 12+51 GB needs ~57 GB T3).
+        # Floor: 64 GB.  Hard cap: 200 GB (no point burning NVMe endurance beyond
+        # what the largest expected model could ever need).
+        # Soft cap: 25% of NVMe drive so we don't hog the disk on small drives.
+        GB_NVME_SWAP=$(( (GB_PHYS + GB_VIRT) * 2 ))
+        [[ $GB_NVME_SWAP -lt 64  ]] && GB_NVME_SWAP=64
+        [[ $GB_NVME_SWAP -gt 200 ]] && GB_NVME_SWAP=200
+        local nvme_quarter=$(( NVME_SIZE_GB / 4 ))
+        [[ $nvme_quarter -gt 64 && $GB_NVME_SWAP -gt $nvme_quarter ]] && GB_NVME_SWAP=$nvme_quarter
+    fi
+
+    GB_NVME_POOL=$(( GB_NVME_SWAP * 89 / 100 ))
 
     # ── Ollama CTX based on available pool ───────────────────────────────
     # Heuristic: large context needs ~12GB KV cache; use 131K if pool >= 40 GB
@@ -172,6 +193,7 @@ print_detected_hardware() {
 
 # Owner-workstation preset — hard-coded optimal for known hardware:
 # ASRock B760M-ITX/D4 | i9-14900KF | RTX 5070 OC 12GB | 64GB DDR4-3600 dual-ch | Samsung 990 EVO Plus 4TB
+
 set_owner_workstation_params() {
     GPU_NAME="ASUS RTX 5070 OC (GB205)"
     CPU_NAME="Intel Core i9-14900KF (8Px2HT + 16E = 32 logical, golden CPU 4-7 @ 6GHz)"
@@ -181,14 +203,14 @@ set_owner_workstation_params() {
     GB_PHYS=12
     GB_VIRT=51
     GB_RESERVE=12
-    GB_NVME_SWAP=64
-    GB_NVME_POOL=58
+    GB_NVME_SWAP=128
+    GB_NVME_POOL=114
     GB_PCORES_MAX=15
     GB_GOLDEN_MIN=4
     GB_GOLDEN_MAX=7
     GB_PCORES_ONLY=1
     GB_OLLAMA_CTX=131072
-    info "Owner-workstation preset applied (i9-14900KF | RTX 5070 12GB | 64GB DDR4-3600 | 4TB NVMe)"
+    info "Owner-workstation preset applied (i9-14900KF | RTX 5070 12GB | 64GB DDR4-3600 | 4TB NVMe, 128 GB swap)"
 }
 
 # ---- Helpers -----------------------------------------------------------
@@ -219,7 +241,7 @@ check_deps() {
     fi
 
     if lsmod | grep -q "^nvidia_uvm "; then
-        info "NVIDIA UVM     : loaded  ✓  (managed memory / DDR4 overflow ready)"
+        info "NVIDIA UVM     : loaded  ✓  (managed memory / system RAM overflow ready)"
     else
         warn "nvidia_uvm not loaded — CUDA UVM overflow unavailable"
         warn "Fix: sudo modprobe nvidia_uvm"
@@ -232,20 +254,23 @@ cmd_install_sys_configs() {
     need_root install-sys-configs
     detect_hardware
 
-    info "Installing GreenBoost v2.3 system configuration files..."
+    info "Installing GreenBoost v2.4 system configuration files..."
 
-    # 1. Ollama service — inject GreenBoost env vars + LD_PRELOAD
+    # 1. Ollama service — inject GreenBoost env vars + LD_PRELOAD (always refresh)
     local svc="/etc/systemd/system/ollama.service"
     if [[ -f "$svc" ]]; then
-        # Add environment lines if not already present
-        if ! grep -q "GREENBOOST_VRAM_HEADROOM_MB" "$svc"; then
-            sed -i "/^\[Service\]/a Environment=\"OLLAMA_FLASH_ATTENTION=1\"\nEnvironment=\"OLLAMA_KV_CACHE_TYPE=q8_0\"\nEnvironment=\"OLLAMA_NUM_CTX=${GB_OLLAMA_CTX}\"\nEnvironment=\"OLLAMA_MAX_LOADED_MODELS=1\"\nEnvironment=\"OLLAMA_KEEP_ALIVE=-1\"\nEnvironment=\"GREENBOOST_VRAM_HEADROOM_MB=2048\"\nEnvironment=\"GREENBOOST_DEBUG=0\"\nEnvironment=\"LD_PRELOAD=/usr/local/lib/libgreenboost_cuda.so\"" "$svc"
-            info "Ollama service: GreenBoost env vars injected"
-        else
-            info "Ollama service: already configured (skip)"
-        fi
+        # Remove any previously injected GreenBoost lines first (idempotent upgrade)
+        sed -i '/OLLAMA_FLASH_ATTENTION/d
+/OLLAMA_KV_CACHE_TYPE/d
+/OLLAMA_NUM_CTX/d
+/OLLAMA_MAX_LOADED_MODELS/d
+/OLLAMA_KEEP_ALIVE/d
+/GREENBOOST_/d
+/libgreenboost/d' "$svc"
+        # Inject fresh v2.4 env vars
+        sed -i "/^\[Service\]/a Environment=\"OLLAMA_FLASH_ATTENTION=1\"\nEnvironment=\"OLLAMA_KV_CACHE_TYPE=q8_0\"\nEnvironment=\"OLLAMA_NUM_CTX=${GB_OLLAMA_CTX}\"\nEnvironment=\"OLLAMA_MAX_LOADED_MODELS=1\"\nEnvironment=\"OLLAMA_KEEP_ALIVE=-1\"\nEnvironment=\"GREENBOOST_VRAM_HEADROOM_MB=2048\"\nEnvironment=\"GREENBOOST_DEBUG=0\"\nEnvironment=\"GREENBOOST_ACTIVE=1\"\nEnvironment=\"LD_PRELOAD=/usr/local/lib/libgreenboost_cuda.so\"" "$svc"
         systemctl daemon-reload
-        info "Ollama service: daemon-reload done"
+        info "Ollama service: GreenBoost v2.4 env vars injected (refreshed)"
     else
         warn "Ollama service not found at $svc — skipping"
     fi
@@ -265,7 +290,7 @@ UDEVEOF
 
     # 2b. NVMe udev rule — scheduler=none, read_ahead=4096, nr_requests=2048
     cat > /etc/udev/rules.d/99-nvme-greenboost.rules << 'UDEVEOF'
-# GreenBoost v2.3 — NVMe tuning for T3 swap performance
+# GreenBoost v2.4 — NVMe tuning for T3 swap performance
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/scheduler}="none"
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/read_ahead_kb}="4096"
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/nr_requests}="2048"
@@ -299,7 +324,7 @@ CPUEOF
     # which triggers the OOM guard and makes T2 unavailable.  Keep nr_hugepages=0.
     mkdir -p /etc/sysfs.d
     cat > /etc/sysfs.d/greenboost-hugepages.conf << 'HPEOF'
-# GreenBoost v2.3 — THP config (no HugeTLB pre-allocation: gb_alloc_buf uses buddy allocator)
+# GreenBoost v2.4 — THP config (no HugeTLB pre-allocation: gb_alloc_buf uses buddy allocator)
 kernel/mm/transparent_hugepage/enabled = always
 HPEOF
     info "THP sysfs conf: /etc/sysfs.d/greenboost-hugepages.conf"
@@ -315,7 +340,7 @@ HPEOF
 
     # 5. VM sysctl — reduce swap pressure, tune write-back
     cat > /etc/sysctl.d/99-greenboost.conf << 'SYSCTLEOF'
-# GreenBoost v2.3 — VM tuning for 3-tier model pool
+# GreenBoost v2.4 — VM tuning for 3-tier model pool
 vm.swappiness = 5
 vm.dirty_ratio = 20
 vm.dirty_background_ratio = 5
@@ -328,8 +353,190 @@ SYSCTLEOF
     warn "Restart Ollama to pick up new env vars: sudo systemctl restart ollama"
 }
 
+cmd_install_llama_configs() {
+    need_root install-llama-configs
+
+    local shim_path="$SHIM_DEST/$SHIM_LIB"
+
+    # /etc/ld.so.preload — inject shim into all processes for zero-config transparency.
+    # Safe with shim v2.4+: the RTLD_NOLOAD guard in the constructor checks whether
+    # libcuda.so.1 is already resident before doing anything.  GDM, shells, and
+    # systemd helpers take the "not a CUDA process" path and remain inert.
+    # Apps that statically link libcuda (llama.cpp, llama-server) get automatic
+    # injection with no wrapper needed.  Apps that load CUDA lazily (Ollama, vLLM)
+    # still need GREENBOOST_ACTIVE=1 from their service unit or greenboost-run.
+    if ! grep -q "libgreenboost" /etc/ld.so.preload 2>/dev/null; then
+        echo "$shim_path" >> /etc/ld.so.preload
+        info "ld.so.preload: added $shim_path (transparent injection for static-CUDA apps)"
+    else
+        info "ld.so.preload: already contains libgreenboost (skip)"
+    fi
+
+    # systemd service — sets LD_PRELOAD + GREENBOOST_ACTIVE only for llama-server.
+    # Only created if a llama-server binary is found.
+    local llama_bin=""
+    for candidate in \
+            /usr/local/bin/llama-server \
+            /usr/bin/llama-server \
+            /opt/llama.cpp/build/bin/llama-server \
+            /opt/ik_llama.cpp/build/bin/llama-server; do
+        [[ -x "$candidate" ]] && { llama_bin="$candidate"; break; }
+    done
+
+    local llama_svc="/etc/systemd/system/llama-server.service"
+    if [[ -n "$llama_bin" ]]; then
+        if [[ ! -f "$llama_svc" ]]; then
+            cat > "$llama_svc" << LLAMAEOF
+[Unit]
+Description=llama.cpp / ik_llama.cpp server with GreenBoost system RAM overflow
+After=network.target greenboost.service
+Wants=greenboost.service
+
+[Service]
+Type=simple
+Environment="LD_PRELOAD=${shim_path}"
+Environment="GREENBOOST_ACTIVE=1"
+Environment="GREENBOOST_VRAM_HEADROOM_MB=3072"
+Environment="GREENBOOST_DEBUG=0"
+ExecStart=${llama_bin} --host 0.0.0.0 --port 8080 --n-gpu-layers 999
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+LLAMAEOF
+            systemctl daemon-reload
+            info "llama-server.service created: $llama_svc"
+            info "  Edit ExecStart to add --model /path/to/model.gguf and other flags"
+            info "  Then: sudo systemctl enable --now llama-server"
+        else
+            if ! grep -q "libgreenboost" "$llama_svc"; then
+                sed -i "/^\[Service\]/a Environment=\"LD_PRELOAD=${shim_path}\"\nEnvironment=\"GREENBOOST_ACTIVE=1\"\nEnvironment=\"GREENBOOST_VRAM_HEADROOM_MB=3072\"" "$llama_svc"
+                systemctl daemon-reload
+                info "llama-server.service: GreenBoost env vars injected"
+            else
+                info "llama-server.service: already configured (skip)"
+            fi
+        fi
+    else
+        info "llama-server binary not found — skipping systemd service"
+        info "  Use greenboost-run for CLI: greenboost-run llama-server ..."
+        info "  If you install llama.cpp later, re-run: sudo ./greenboost_setup.sh install-llama-configs"
+    fi
+
+    echo ""
+    info "llama.cpp / ik_llama.cpp integration complete."
+    info "  systemd service: LD_PRELOAD + GREENBOOST_ACTIVE configured automatically"
+    info "  CLI usage      : greenboost-run llama-server --n-gpu-layers 999 ..."
+    info "  Use --n-gpu-layers 999 to push everything through the virtual VRAM pool."
+}
+
+# ---- do_purge — remove ALL previously installed GreenBoost artifacts -----
+# Internal helper (no root check — callers must ensure root).
+# purge_venv=1 also removes /opt/greenboost (expensive Python venv).
+# Called by cmd_uninstall (purge_venv=1) and cmd_full_install (purge_venv=0).
+do_purge() {
+    local purge_venv="${1:-0}"
+
+    # 1. Stop services that hold /dev/greenboost open (prevents rmmod EBUSY)
+    for svc in ollama llama-server; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            info "  [purge] Stopping $svc service..."
+            systemctl stop "$svc" 2>/dev/null || true
+            GB_STOPPED_SERVICES="$GB_STOPPED_SERVICES $svc"
+        fi
+    done
+    # Kill any remaining process with the device open
+    if [[ -e /dev/greenboost ]]; then
+        fuser -k /dev/greenboost 2>/dev/null || true
+        sleep 0.5
+    fi
+
+    # 1. Unload module if running
+    if lsmod | grep -q "^${DRIVER_NAME} "; then
+        rmmod "$DRIVER_NAME" 2>/dev/null \
+            && info "  [purge] Module unloaded" \
+            || warn "  [purge] rmmod failed — continuing"
+    fi
+
+    # 2. Remove kernel module from /lib/modules
+    local ko_extra="/lib/modules/$(uname -r)/extra/greenboost.ko"
+    local ko_upd="/lib/modules/$(uname -r)/updates/greenboost.ko"
+    for f in "$ko_extra" "$ko_upd"; do
+        [[ -f "$f" ]] && rm -f "$f" && info "  [purge] Removed $f"
+    done
+    depmod -a 2>/dev/null || true
+
+    # 3. Remove CUDA shim
+    if [[ -f "$SHIM_DEST/$SHIM_LIB" ]]; then
+        rm -f "$SHIM_DEST/$SHIM_LIB"
+        info "  [purge] Removed $SHIM_DEST/$SHIM_LIB"
+    fi
+    ldconfig 2>/dev/null || true
+
+    # 4. Remove shim from /etc/ld.so.preload
+    if [[ -f /etc/ld.so.preload ]] && grep -q "libgreenboost" /etc/ld.so.preload; then
+        sed -i '/libgreenboost/d' /etc/ld.so.preload
+        info "  [purge] /etc/ld.so.preload: shim entry removed"
+        # Remove the file entirely if now empty
+        [[ -s /etc/ld.so.preload ]] || rm -f /etc/ld.so.preload
+    fi
+
+    # 5. Remove static config files
+    for f in \
+        /etc/modprobe.d/greenboost.conf \
+        /etc/profile.d/greenboost.sh \
+        /usr/local/bin/greenboost-run \
+        /etc/modules-load.d/greenboost.conf \
+        /etc/udev/rules.d/99-greenboost.rules \
+        /etc/udev/rules.d/99-nvme-greenboost.rules \
+        /etc/sysctl.d/99-greenboost.conf \
+        /etc/sysfs.d/greenboost-hugepages.conf; do
+        [[ -f "$f" ]] && rm -f "$f" && info "  [purge] Removed $f"
+    done
+    udevadm control --reload-rules 2>/dev/null || true
+
+    # 6. Disable + remove cpu-perf service
+    if [[ -f /etc/systemd/system/cpu-perf.service ]]; then
+        systemctl disable --now cpu-perf.service 2>/dev/null || true
+        rm -f /etc/systemd/system/cpu-perf.service
+        info "  [purge] Removed cpu-perf.service"
+    fi
+
+    # 7. Remove GreenBoost env lines from Ollama service
+    local svc="/etc/systemd/system/ollama.service"
+    if [[ -f "$svc" ]] && grep -qE "GREENBOOST_|libgreenboost" "$svc"; then
+        sed -i '/OLLAMA_FLASH_ATTENTION/d
+/OLLAMA_KV_CACHE_TYPE/d
+/OLLAMA_NUM_CTX/d
+/OLLAMA_MAX_LOADED_MODELS/d
+/OLLAMA_KEEP_ALIVE/d
+/GREENBOOST_/d
+/libgreenboost/d' "$svc"
+        info "  [purge] Ollama service: GreenBoost env lines removed"
+    fi
+
+    # 8. Remove GreenBoost env lines from llama-server service (keep file, strip our lines)
+    if [[ -f /etc/systemd/system/llama-server.service ]] && \
+       grep -q "libgreenboost" /etc/systemd/system/llama-server.service; then
+        sed -i '/libgreenboost/d
+/GREENBOOST_/d' /etc/systemd/system/llama-server.service
+        info "  [purge] llama-server.service: GreenBoost env lines removed"
+    fi
+
+    systemctl daemon-reload 2>/dev/null || true
+
+    # 9. Optionally remove Python venv (slow to rebuild — only for full uninstall)
+    if [[ "$purge_venv" == "1" && -d /opt/greenboost ]]; then
+        rm -rf /opt/greenboost
+        info "  [purge] Removed /opt/greenboost (Python venv)"
+    fi
+
+    info "  [purge] Done."
+}
+
 cmd_build() {
-    info "Building GreenBoost v2.3 (3-tier: VRAM + DDR4 + NVMe)..."
+    info "Building GreenBoost v2.4 (3-tier: VRAM + system RAM + NVMe)..."
     make -C "$MODULE_DIR" all || die "Build failed — check output above"
     info "Build complete:"
     info "  Kernel module : $MODULE_DIR/greenboost.ko"
@@ -360,18 +567,25 @@ options greenboost physical_vram_gb=${GB_PHYS} virtual_vram_gb=${GB_VIRT} safety
 MODEOF
 
     # profile.d helper
+    # GREENBOOST_ACTIVE=1 is needed for apps that load CUDA lazily via dlopen
+    # at runtime (vLLM, PyTorch scripts).  Static-CUDA apps (llama.cpp) get
+    # injection automatically via ld.so.preload without needing this flag.
     cat > /etc/profile.d/greenboost.sh << PROFEOF
-# GreenBoost v2.3 — shell helpers
+# GreenBoost v2.4 — shell helpers
 export GREENBOOST_SHIM="$SHIM_DEST/$SHIM_LIB"
-greenboost-run() { LD_PRELOAD="\$GREENBOOST_SHIM" "\$@"; }
+# greenboost-run: for apps that load CUDA lazily (vLLM, PyTorch, etc.)
+# Static-CUDA apps (llama.cpp, llama-server) work automatically via ld.so.preload.
+greenboost-run() { GREENBOOST_ACTIVE=1 LD_PRELOAD="\$GREENBOOST_SHIM" "\$@"; }
 export -f greenboost-run
 PROFEOF
 
-    # Standalone wrapper
+    # Standalone wrapper (sets GREENBOOST_ACTIVE for lazy-dlopen CUDA apps)
     cat > /usr/local/bin/greenboost-run << WRAPEOF
 #!/usr/bin/env bash
-# Run a CUDA application with GreenBoost DDR4 overflow enabled
-LD_PRELOAD="$SHIM_DEST/$SHIM_LIB" "\$@"
+# Run a CUDA application with GreenBoost system RAM overflow enabled.
+# Needed for apps that load CUDA lazily via dlopen (vLLM, PyTorch, etc.).
+# Static-CUDA apps (llama.cpp) work automatically via ld.so.preload.
+GREENBOOST_ACTIVE=1 LD_PRELOAD="$SHIM_DEST/$SHIM_LIB" "\$@"
 WRAPEOF
     chmod +x /usr/local/bin/greenboost-run
 
@@ -397,6 +611,12 @@ cmd_load() {
 
     if lsmod | grep -q "^${DRIVER_NAME} "; then
         warn "Module already loaded — reloading..."
+        # Stop consumers before rmmod to avoid EBUSY
+        for svc in ollama llama-server; do
+            systemctl is-active --quiet "$svc" 2>/dev/null && \
+                systemctl stop "$svc" 2>/dev/null || true
+        done
+        [[ -e /dev/greenboost ]] && { fuser -k /dev/greenboost 2>/dev/null || true; sleep 0.5; }
         rmmod "$DRIVER_NAME" || die "Failed to unload existing module"
     fi
 
@@ -415,7 +635,7 @@ cmd_load() {
         pcores_only="$pcores_only" \
         || die "insmod failed — check: dmesg | tail -20"
 
-    info "GreenBoost v2.3 loaded — 3-tier pool active!"
+    info "GreenBoost v2.4 loaded — 3-tier pool active!"
     info ""
     info "  T1 ${GPU_NAME} : ${phys} GB  [hot layers]"
     info "  T2 ${RAM_TYPE} pool         : ${virt} GB  [cold layers]"
@@ -441,33 +661,8 @@ cmd_unload() {
 
 cmd_uninstall() {
     need_root uninstall
-
-    # 1. Unload if running
-    if lsmod | grep -q "^${DRIVER_NAME} "; then
-        info "Unloading module..."
-        rmmod "$DRIVER_NAME" || warn "rmmod failed — continuing cleanup"
-    fi
-
-    # 2. Remove installed kernel module
-    local ko_path="/lib/modules/$(uname -r)/extra/greenboost.ko"
-    local ko_upd="/lib/modules/$(uname -r)/updates/greenboost.ko"
-    for f in "$ko_path" "$ko_upd"; do
-        if [[ -f "$f" ]]; then
-            rm -f "$f" && info "Removed $f"
-        fi
-    done
-    depmod -a && info "depmod updated"
-
-    # 3. Remove CUDA shim
-    rm -f "$SHIM_DEST/$SHIM_LIB" && info "Removed $SHIM_DEST/$SHIM_LIB"
-    ldconfig
-
-    # 4. Remove config files
-    rm -f /etc/modprobe.d/greenboost.conf  && info "Removed modprobe config"
-    rm -f /etc/profile.d/greenboost.sh     && info "Removed profile.d entry"
-    rm -f /usr/local/bin/greenboost-run    && info "Removed greenboost-run wrapper"
-    rm -f /etc/modules-load.d/greenboost.conf && info "Removed modules-load entry"
-
+    info "Removing all GreenBoost artifacts (module, shim, configs, services, venv)..."
+    do_purge 1
     info ""
     info "GreenBoost uninstalled cleanly."
 }
@@ -712,7 +907,7 @@ cmd_tune_sysctl() {
     echo ""
 
     # Write the header line with detected hardware (variables don't expand in 'HEREDOC')
-    printf '# GreenBoost v2.3 — Definitive sysctl config\n' > "$dest"
+    printf '# GreenBoost v2.4 — Definitive sysctl config\n' > "$dest"
     printf '# Hardware: %s | %s | %s-%s | %s GB NVMe\n' \
         "${CPU_NAME}" "${GPU_NAME}" "${RAM_TYPE}" "${RAM_SPEED_MT}" "${NVME_SIZE_GB}" >> "$dest"
     printf '# Loaded last (99-zzz) — wins all conflicts with earlier sysctl.d files.\n' >> "$dest"
@@ -721,7 +916,7 @@ cmd_tune_sysctl() {
     cat >> "$dest" << 'SYSCTL_EOF'
 
 # ── Swap / memory pressure ───────────────────────────────────────────────
-# Keep LLM weights in DDR4 (T2); only spill to NVMe (T3) under real pressure.
+# Keep LLM weights in system RAM (T2); only spill to NVMe (T3) under real pressure.
 vm.swappiness = 10
 
 # ── Write-back (Samsung 990 EVO Plus sustains 6,300 MB/s writes) ─────────
@@ -932,7 +1127,7 @@ cmd_tune_libs() {
 
 cmd_tune_all() {
     need_root tune-all
-    info "Running full system tuning for GreenBoost v2.3..."
+    info "Running full system tuning for GreenBoost v2.4..."
     echo ""
     cmd_tune
     echo ""
@@ -948,7 +1143,7 @@ cmd_tune_all() {
 
 cmd_status() {
     echo ""
-    echo -e "${BLU}=== GreenBoost v2.3 Status (3-tier pool) ===${NC}"
+    echo -e "${BLU}=== GreenBoost v2.4 Status (3-tier pool) ===${NC}"
     echo ""
 
     if lsmod | grep -q "^${DRIVER_NAME} "; then
@@ -972,7 +1167,7 @@ cmd_status() {
 cmd_help() {
     detect_hardware 2>/dev/null
     echo ""
-    echo -e "${BLU}GreenBoost v2.3 — 3-Tier GPU Memory Pool${NC}"
+    echo -e "${BLU}GreenBoost v2.4 — 3-Tier GPU Memory Pool${NC}"
     echo "Author : Ferran Duarri"
     echo "CPU    : ${CPU_NAME}"
     echo "GPU    : ${GPU_NAME}  (${GB_PHYS} GB VRAM)"
@@ -988,36 +1183,36 @@ cmd_help() {
     echo "USAGE:  sudo ./greenboost_setup.sh <command>"
     echo ""
     echo "COMMANDS:"
-    echo "  install     Build and install module + CUDA shim system-wide"
-    echo "  uninstall   Unload, remove module + all config files"
-    echo "  build       Build only (no system install)"
-    echo "  load        Load module with default 3-tier parameters"
-    echo "  unload      Unload module (keeps installed files)"
-    echo "  tune        Tune system for LLM workloads (governor, NVMe, THP, sysctl)"
-    echo "  tune-grub   Fix GRUB boot params (THP=always, rcu_nocbs, nohz_full…)"
-    echo "  tune-sysctl Consolidate sysctl files + apply compute-optimized knobs"
-    echo "  tune-libs   Install missing AI/compute libraries (OpenBLAS, hwloc…)"
-    echo "  tune-all    Run tune + tune-grub + tune-sysctl + tune-libs in sequence"
-    echo "  install-sys-configs  Install Ollama env, NVMe udev, CPU governor, hugepages, sysctl"
-    echo "  install-deps         Install all Ubuntu OS packages (build + CUDA + AI libs)"
-    echo "  setup-swap [GB]      Create/activate NVMe swap (default: auto-sized, ~64 GB for target model)"
-    echo "  full-install [--owner-workstation]  Complete install — hardware auto-detected or owner preset"
-    echo "  status      Show module status and 3-tier pool info"
-    echo "  diagnose    Full health check — run this after reboot to verify everything works"
+    echo "  full-install   Complete install — deps, module, shim, configs, tune-all, ExLlamaV3"
+    echo "  install        Build and install module + CUDA shim system-wide"
+    echo "  uninstall      Unload, remove module + all config files"
+    echo "  build          Build only (no system install)"
+    echo "  load           Load module with default 3-tier parameters"
+    echo "  unload         Unload module (keeps installed files)"
+    echo "  tune           Tune system for LLM workloads (governor, NVMe, THP, sysctl)"
+    echo "  tune-grub      Fix GRUB boot params (THP=always, rcu_nocbs, nohz_full…)"
+    echo "  tune-sysctl    Consolidate sysctl files + apply compute-optimized knobs"
+    echo "  tune-libs      Install missing AI/compute libraries (OpenBLAS, hwloc…)"
+    echo "  tune-all       Run tune + tune-grub + tune-sysctl + tune-libs in sequence"
+    echo "  install-sys-configs    Install Ollama env, NVMe udev, CPU governor, hugepages, sysctl"
+    echo "  install-llama-configs  Transparent llama.cpp/ik_llama.cpp injection via ld.so.preload"
+    echo "  install-deps           Install all Ubuntu OS packages (build + CUDA + AI libs)"
+    echo "  status         Show module status and 3-tier pool info"
+    echo "  diagnose       Full health check — run after reboot to verify everything works"
     echo "  optimize-model [--model M] [--strategy tensorrt|lora|exllama|all]"
-    echo "               Optimize LLM for max speed: TRT-LLM, LoRA, ExLlamaV3"
-    echo "  help        Show this help"
+    echo "                 Optimize LLM for max speed: TRT-LLM, LoRA, ExLlamaV3"
+    echo "  help           Show this help"
     echo ""
     echo "ENVIRONMENT (for load, detected defaults shown):"
     echo "  GPU_PHYS_GB=${GB_PHYS}     Physical VRAM in GB          (detected: ${GPU_NAME})"
-    echo "  VIRT_VRAM_GB=${GB_VIRT}    DDR4 pool size in GB         (detected: ${GB_VIRT} GB)"
+    echo "  VIRT_VRAM_GB=${GB_VIRT}    system RAM pool size in GB         (detected: ${GB_VIRT} GB)"
     echo "  RESERVE_GB=${GB_RESERVE}      System RAM to keep free      (detected: ${GB_RESERVE} GB)"
     echo "  NVME_SWAP_GB=${GB_NVME_SWAP}    NVMe swap capacity in GB     (detected: ${GB_NVME_SWAP} GB)"
     echo "  NVME_POOL_GB=${GB_NVME_POOL}    GreenBoost T3 soft cap in GB (detected: ${GB_NVME_POOL} GB)"
     echo ""
     echo "  Example: sudo VIRT_VRAM_GB=48 NVME_SWAP_GB=64 ./greenboost_setup.sh load"
     echo ""
-    echo "CUDA SHIM (transparent DDR4 overflow via NVIDIA UVM):"
+    echo "CUDA SHIM (transparent system RAM overflow via NVIDIA UVM):"
     echo "  Prerequisite  : sudo modprobe nvidia_uvm"
     echo "  One-shot      : LD_PRELOAD=./libgreenboost_cuda.so  ./your_cuda_app"
     echo "  After install : greenboost-run  ./your_cuda_app"
@@ -1035,11 +1230,11 @@ cmd_help() {
 }
 
 # ---- install-deps ------------------------------------------------------
-# Install all Ubuntu packages needed for GreenBoost v2.3 + ExLlamaV3
+# Install all Ubuntu packages needed for GreenBoost v2.4 + ExLlamaV3
 
 cmd_install_deps() {
     need_root install-deps
-    info "Installing Ubuntu dependencies for GreenBoost v2.3 + ExLlamaV3..."
+    info "Installing Ubuntu dependencies for GreenBoost v2.4 + ExLlamaV3..."
     info "Running apt-get update..."
     apt-get update -qq
 
@@ -1076,76 +1271,16 @@ cmd_install_deps() {
     info "Note: NVIDIA driver 580+ and CUDA 13 must be installed separately."
 }
 
-# ---- setup-swap --------------------------------------------------------
-# Create NVMe swap file (T3 tier). Safe to re-run — idempotent.
-
-cmd_setup_swap() {
-    need_root setup-swap
-    detect_hardware 2>/dev/null  # populate GB_NVME_SWAP if not already set
-    local _default_swap="${GB_NVME_SWAP:-64}"
-    local gb="${2:-${_default_swap}}"
-    [[ "$1" == "setup-swap" ]] && gb="${2:-${_default_swap}}" || gb="${1:-${_default_swap}}"
-    local swap_file="/swap_nvme.img"
-    local swap_bytes=$(( gb * 1024 * 1024 * 1024 ))
-
-    info "Setting up NVMe swap file: $swap_file ($gb GB)..."
-
-    if [[ -f "$swap_file" ]]; then
-        local cur_size; cur_size=$(stat -c%s "$swap_file" 2>/dev/null || echo 0)
-        if [[ "$cur_size" -ge "$swap_bytes" ]]; then
-            info "Swap file already exists and is large enough ($gb GB): $swap_file"
-        else
-            local cur_gb=$(( cur_size / 1024 / 1024 / 1024 ))
-            warn "Swap file exists but is only ${cur_gb} GB (want $gb GB) — expanding..."
-            # swapoff only if currently active (swapoff on inactive swap → "Invalid argument")
-            if swapon --show --noheadings 2>/dev/null | grep -q "$swap_file"; then
-                swapoff "$swap_file" || die "swapoff $swap_file failed"
-                info "Swap deactivated for expansion"
-            fi
-            fallocate -l "${gb}G" "$swap_file" 2>/dev/null || \
-                dd if=/dev/zero of="$swap_file" bs=1G count="$gb" status=progress || \
-                die "Failed to expand swap file $swap_file"
-            chmod 600 "$swap_file"
-            mkswap "$swap_file" || die "mkswap failed after expansion"
-            info "Swap file expanded to ${gb} GB"
-        fi
-    else
-        info "Creating ${gb} GB swap file (fallocate — fast on NVMe)..."
-        fallocate -l "${gb}G" "$swap_file" 2>/dev/null || \
-            dd if=/dev/zero of="$swap_file" bs=1G count="$gb" status=progress || \
-            die "Failed to create swap file $swap_file"
-        chmod 600 "$swap_file"
-        mkswap "$swap_file" || die "mkswap failed"
-        info "Swap file created: $swap_file"
-    fi
-
-    # Activate if not already active
-    if ! swapon --show | grep -q "$swap_file"; then
-        swapon -p 10 "$swap_file" && info "Swap activated (priority=10)" \
-            || warn "swapon failed — may need reboot"
-    else
-        info "Swap already active: $swap_file"
-    fi
-
-    # Add to fstab if missing
-    if ! grep -q "$swap_file" /etc/fstab; then
-        echo "$swap_file  none  swap  sw,pri=10  0 0" >> /etc/fstab
-        info "Added to /etc/fstab: $swap_file"
-    else
-        info "/etc/fstab: $swap_file already present"
-    fi
-
-    echo ""
-    swapon --show | sed 's/^/  /'
-}
 
 # ---- full-install ------------------------------------------------------
 # Complete fresh-OS install — run this after a clean Ubuntu install.
-# Covers: OS deps, NVMe swap, kernel module, CUDA shim, all system configs,
+# Covers: OS deps, kernel module, CUDA shim, all system configs,
 # sysctl tuning, GRUB params, and optional ExLlamaV3 with GreenBoost patches.
+# NVMe swap (T3 tier) is intentionally NOT touched — configure manually before running.
 
 cmd_full_install() {
     need_root full-install
+    GB_STOPPED_SERVICES=""
 
     # ── Distro detection: delegate to Rocky/RHEL script on Red Hat-based systems ──
     if [[ -f /etc/redhat-release ]] || \
@@ -1172,46 +1307,46 @@ cmd_full_install() {
     else
         detect_hardware
         info "╔══════════════════════════════════════════════════════════════╗"
-        info "║  GreenBoost — Dynamic Install (hardware auto-detected)      ║"
+        info "║  GreenBoost — Full Install (hardware auto-detected)         ║"
         info "╚══════════════════════════════════════════════════════════════╝"
         print_detected_hardware
     fi
     echo ""
 
-    # 1/7 — OS dependencies
-    info "[1/7] Installing Ubuntu OS dependencies..."
+    # 0/6 — Purge any previous GreenBoost install to guarantee a clean slate
+    info "[0/6] Purging previous GreenBoost installation (if any)..."
+    do_purge 0   # keep /opt/greenboost venv — expensive to rebuild
+    echo ""
+
+    # 1/6 — OS dependencies
+    info "[1/6] Installing Ubuntu OS dependencies..."
     cmd_install_deps
     echo ""
 
-    # 2/7 — NVMe swap (T3 tier, auto-sized)
-    info "[2/7] Setting up NVMe swap file (T3 tier, ${GB_NVME_SWAP} GB)..."
-    cmd_setup_swap "${GB_NVME_SWAP}"
-    echo ""
-
-    # 3/7 — Build + install kernel module + CUDA shim
-    info "[3/7] Building and installing kernel module + CUDA shim..."
+    # 2/6 — Build + install kernel module + CUDA shim
+    info "[2/6] Building and installing kernel module + CUDA shim..."
     cmd_install
     echo ""
 
-    # 4/7 — Load kernel module
-    info "[4/7] Loading kernel module with 3-tier params..."
+    # 3/6 — Load kernel module
+    info "[3/6] Loading kernel module with 3-tier params..."
     cmd_load
     echo ""
 
-    # 5/7 — System configs: Ollama, NVMe udev, CPU governor, hugepages, sysctl
-    info "[5/7] Installing system configuration files..."
+    # 4/6 — System configs: Ollama, NVMe udev, CPU governor, hugepages, sysctl + llama.cpp
+    info "[4/6] Installing system configuration files..."
     cmd_install_sys_configs
     echo ""
-
-    # 6/7 — Enhanced sysctl + GRUB params
-    info "[6/7] Applying sysctl tuning and GRUB boot params..."
-    cmd_tune_sysctl
-    echo ""
-    cmd_tune_grub
+    cmd_install_llama_configs
     echo ""
 
-    # 7/7 — ExLlamaV3 + Python tools (kvpress, modelopt, unsloth)
-    info "[7/7] Setting up Python venv + ExLlamaV3 + inference tools..."
+    # 5/6 — Full system tuning: CPU governor, NVMe, THP, vm params, GRUB, AI libs
+    info "[5/6] Applying full system tuning (tune-all)..."
+    cmd_tune_all
+    echo ""
+
+    # 6/6 — ExLlamaV3 + Python tools (kvpress, modelopt, unsloth)
+    info "[6/6] Setting up Python venv + ExLlamaV3 + inference tools..."
     local exllama_dir="$MODULE_DIR/libraries/exllamav3"
     local venv_dir="/opt/greenboost/venv"
 
@@ -1307,6 +1442,14 @@ cmd_full_install() {
     info "Activate with:  source $venv_dir/bin/activate"
     echo ""
 
+    # Restart only services that were stopped during purge
+    for svc in $GB_STOPPED_SERVICES; do
+        info "Restarting $svc (was running before install)..."
+        systemctl restart "$svc" 2>/dev/null \
+            && info "$svc restarted." \
+            || warn "$svc restart failed — run: sudo systemctl restart $svc"
+    done
+
     info "╔══════════════════════════════════════════════════════════════╗"
     info "║  Full install complete!                                      ║"
     info "╚══════════════════════════════════════════════════════════════╝"
@@ -1318,8 +1461,20 @@ cmd_full_install() {
     info "After reboot, run the health check:"
     info "  sudo ./greenboost_setup.sh diagnose"
     echo ""
-    info "If models still appear stuck (CPU fallback), diagnose will show the issue."
-    info "For live Ollama logs: journalctl -u ollama -f"
+    info "─────────────────────────────────────────────────────────────────"
+    info "NVMe swap (T3 tier) was NOT touched by this installer."
+    info "GreenBoost will use whatever swap is already active on the system."
+    echo ""
+    info "Recommended swap sizes for the target models on this hardware:"
+    info "  glm-4.7-flash:latest       (19 GB)   →  at least  10 GB NVMe swap"
+    info "  glm-4.7-flash:q8_0         (32 GB)   →  at least  30 GB NVMe swap"
+    info "  nemotron-3-super:120b:latest (87 GB)  →  at least  80 GB NVMe swap"
+    info "    (weights overflow ~$((87 - GB_PHYS - GB_VIRT)) GB + KV cache ~40-50 GB at 256K ctx)"
+    info "  Full T3 capacity                      →  ${GB_NVME_SWAP} GB  (NVMe SSD)"
+    echo ""
+    info "Configure swap manually with standard tools (fallocate / mkswap / swapon)"
+    info "and add the entry to /etc/fstab with priority=10."
+    info "─────────────────────────────────────────────────────────────────"
 }
 
 # ---- optimize-model ----------------------------------------------------
@@ -1388,7 +1543,7 @@ cmd_optimize_model() {
             || echo -e "    $miss  $exllama_dir"
         local elv3_cache="$exllama_dir/exllamav3/cache/greenboost.py"
         [[ -f "$elv3_cache" ]] \
-            && echo -e "    $ok  CacheLayer_greenboost (GreenBoost DDR4 KV cache bridge)" \
+            && echo -e "    $ok  CacheLayer_greenboost (GreenBoost system RAM KV cache bridge)" \
             || echo -e "    $miss  CacheLayer_greenboost not found"
 
         echo ""
@@ -1459,13 +1614,13 @@ cmd_optimize_model() {
 
     # ── ExLlamaV3 + GreenBoost DDR4 KV cache ─────────────────────────────
     if [[ "$strategy" == "exllama" || "$strategy" == "all" ]]; then
-        _sect_opt "ExLlamaV3 + GreenBoost DDR4 KV Cache"
+        _sect_opt "ExLlamaV3 + GreenBoost system RAM KV Cache"
         if [[ ! -d "$exllama_dir" ]]; then
             warn "  ExLlamaV3 not found at $exllama_dir"
         else
             info "  ExLlamaV3: $exllama_dir"
-            info "  CacheLayer_greenboost: routes KV cache → Tier 2 DDR4 DMA-BUF pages"
-            info "  Benefit: 131K context without VRAM OOM (KV cache in DDR4, not VRAM)"
+            info "  CacheLayer_greenboost: routes KV cache → Tier 2 system RAM DMA-BUF pages"
+            info "  Benefit: 131K context without VRAM OOM (KV cache in system RAM, not VRAM)"
             echo ""
             # Install if needed
             if [[ -d "$venv_dir" ]]; then
@@ -1487,7 +1642,7 @@ cmd_optimize_model() {
             echo ""
             info "  Convert HF model to EXL3 (4× smaller, faster decode):"
             info "    $MODULE_DIR/tools/greenboost-exllama.sh --model THUDM/glm-4.7-flash-hf --exl3-convert --bpw 4.0"
-            info "  After EXL3 (4bpw, ~8 GB): fits in VRAM — no DDR4 overflow needed"
+            info "  After EXL3 (4bpw, ~8 GB): fits in VRAM — no system RAM overflow needed"
         fi
     fi
 
@@ -1521,7 +1676,7 @@ cmd_optimize_model() {
         else
             info "  ModelOpt PTQ: no retraining — calibration only (~5-30 min)"
             info "  Scheme: $quant  |  Model: ${hf_model:-$model}"
-            info "  Result: 2-4× smaller model → less Tier 2 DDR4 pressure"
+            info "  Result: 2-4× smaller model → less Tier 2 system RAM pressure"
             echo ""
             if [[ -n "$hf_model" ]]; then
                 info "  Running PTQ on $hf_model ..."
@@ -1642,7 +1797,7 @@ cmd_diagnose() {
 
     # Log header
     {
-        echo "=== GreenBoost v2.3 Diagnose Log ==="
+        echo "=== GreenBoost v2.4 Diagnose Log ==="
         echo "timestamp=$(date '+%Y-%m-%d %H:%M:%S')"
         echo "kernel=$(uname -r)"
         echo "host=$(hostname)"
@@ -1652,7 +1807,7 @@ cmd_diagnose() {
 
     echo ""
     echo -e "${BLU}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLU}║  GreenBoost v2.3 — Full Diagnostic + Model Benchmark        ║${NC}"
+    echo -e "${BLU}║  GreenBoost v2.4 — Full Diagnostic + Model Benchmark        ║${NC}"
     echo -e "${BLU}╚══════════════════════════════════════════════════════════════╝${NC}"
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -1683,9 +1838,9 @@ cmd_diagnose() {
         _fail "nvidia NOT loaded — run: sudo modprobe nvidia"
     fi
     if lsmod | grep -q "^nvidia_uvm "; then
-        _chk "nvidia_uvm loaded (DDR4 UVM overflow available)"
+        _chk "nvidia_uvm loaded (system RAM UVM overflow available)"
     else
-        _fail "nvidia_uvm NOT loaded — DDR4 overflow via UVM disabled"
+        _fail "nvidia_uvm NOT loaded — system RAM overflow via UVM disabled"
         _rec "sudo modprobe nvidia_uvm && echo nvidia_uvm | sudo tee /etc/modules-load.d/nvidia-uvm.conf"
     fi
     local vram_free_mb="" vram_total_mb=""
@@ -1737,13 +1892,13 @@ cmd_diagnose() {
         elif echo "$shim_out" | grep -q "UVM overflow.*unavailable"; then
             _warn "Shim init: UVM overflow unavailable — load nvidia_uvm"
         fi
-        # Check dlsym hook present (v2.3+) — required to intercept dlopen+dlsym GPU API calls
+        # Check dlsym hook present (v2.4+) — required to intercept dlopen+dlsym GPU API calls
         if strings "$shim" 2>/dev/null | grep -q "dlsym hook"; then
             _chk "dlsym hook present (intercepts Ollama dlopen+dlsym GPU API calls)"
         else
             _fail "dlsym hook MISSING — Ollama NVML/CUDA discovery sees only physical VRAM"
             _info "Rebuild shim: cd $MODULE_DIR && make shim && sudo ./deploy_fix.sh"
-            _rec "Rebuild shim v2.3: cd $MODULE_DIR && make shim && sudo ./deploy_fix.sh"
+            _rec "Rebuild shim v2.4: cd $MODULE_DIR && make shim && sudo ./deploy_fix.sh"
         fi
     fi
 
@@ -1824,7 +1979,7 @@ cmd_diagnose() {
 
     # HugeTLB pages — must be 0 (GreenBoost uses buddy allocator, not HugeTLB pool)
     # Pre-allocating HugeTLB pages locks RAM away from the buddy allocator, making
-    # the OOM guard always fire and blocking all T2 DDR4 allocations.
+    # the OOM guard always fire and blocking all T2 system RAM allocations.
     local hp_total
     hp_total=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null || echo 0)
     if [[ $hp_total -eq 0 ]]; then
@@ -1838,7 +1993,7 @@ cmd_diagnose() {
     # NVMe scheduler
     local nvme_sched; nvme_sched=$(cat /sys/block/nvme0n1/queue/scheduler 2>/dev/null | grep -oP '\[\K[^\]]+')
     [[ "$nvme_sched" == "none" ]] \
-        && _chk "NVMe scheduler: none (optimal for Samsung 990)" \
+        && _chk "NVMe scheduler: none (optimal for NVMe SSD)" \
         || { _warn "NVMe scheduler: ${nvme_sched:-unknown} (should be none)"; _rec "sudo ./greenboost_setup.sh tune"; }
 
     # NVMe swap T3
@@ -1849,7 +2004,7 @@ cmd_diagnose() {
         _chk "T3 NVMe swap: ${sw_used}/${sw_size} used"
     else
         _warn "T3 NVMe swap /swap_nvme.img not active"
-        _rec "sudo ./greenboost_setup.sh setup-swap"
+        _rec "Configure swap manually — see: sudo ./greenboost_setup.sh help"
     fi
 
     # vm.swappiness
@@ -1890,7 +2045,7 @@ except:
         local PROMPT="List all 8 planets of the solar system in order from the Sun, one per line, prefixed with their number."
         local test_start; test_start=$(date --iso-8601=seconds)
 
-        # num_gpu=999 forces all layers to GPU so the shim can route DDR4 overflow
+        # num_gpu=999 forces all layers to GPU so the shim can route system RAM overflow
         _info "Sending inference request (stream=false, num_predict=150, num_gpu=999)..."
         local response; response=$(curl -s --max-time 400 \
             http://127.0.0.1:11434/api/generate \
@@ -1970,13 +2125,13 @@ except Exception as e:
         if [[ "$gpu_layers" == "?" ]]; then
             _warn "Could not read GPU layer count — check: journalctl -u ollama | grep offloaded"
         elif [[ "$gpu_n" -eq 0 ]]; then
-            _fail "0 GPU layers — model running CPU-ONLY (GreenBoost DDR4 overflow not working)"
+            _fail "0 GPU layers — model running CPU-ONLY (GreenBoost system RAM overflow not working)"
             _rec  "Fix shim: cd $MODULE_DIR && make shim && sudo ./deploy_fix.sh && sudo systemctl restart ollama"
         elif [[ "$gpu_n" -lt "$gpu_total" ]]; then
             _warn "Partial GPU offload: $gpu_layers layers (expected $gpu_total/$(echo $gpu_total)) — cuDeviceTotalMem hook missing or num_gpu not passed"
             _rec  "Rebuild shim: make shim && sudo cp libgreenboost_cuda.so /usr/local/lib/ && sudo systemctl restart ollama"
         else
-            _chk  "Full GPU offload: $gpu_layers layers (all layers via GreenBoost DDR4 overflow)"
+            _chk  "Full GPU offload: $gpu_layers layers (all layers via GreenBoost system RAM overflow)"
         fi
 
         # Evaluate throughput
@@ -1985,7 +2140,7 @@ except Exception as e:
             _fail "Throughput ${tps} tok/s — very slow (likely CPU fallback or model hung)"
             _rec  "Check Ollama logs: journalctl -u ollama --since '5 min ago' | grep -E 'offloaded|cudaMalloc'"
         elif [[ $tps_int -lt 50 ]]; then  # < 5 tok/s
-            _warn "Throughput ${tps} tok/s — partial GPU (PCIe/DDR4 bandwidth limit expected for this model size)"
+            _warn "Throughput ${tps} tok/s — partial GPU (PCIe/system RAM bandwidth limit expected for this model size)"
         else
             _chk  "Throughput ${tps} tok/s — good"
         fi
@@ -2018,7 +2173,7 @@ except Exception as e:
     # VRAM headroom vs model sizes
     local headroom; headroom=$(echo "$env_str" | grep -oP 'GREENBOOST_VRAM_HEADROOM_MB=\d+' | cut -d= -f2)
     headroom=${headroom:-1024}
-    _info "GREENBOOST_VRAM_HEADROOM_MB=$headroom — shim overflows to DDR4 when VRAM free < this"
+    _info "GREENBOOST_VRAM_HEADROOM_MB=$headroom — shim overflows to system RAM when VRAM free < this"
     if [[ -n "$vram_total_mb" && $headroom -gt $(( vram_total_mb / 6 )) ]]; then
         _rec "GREENBOOST_VRAM_HEADROOM_MB=$headroom may be too conservative for ${vram_total_mb}MB GPU — try 512"
     fi
@@ -2091,9 +2246,9 @@ case "$COMMAND" in
     build)              cmd_build              ;;
     load)               cmd_load               ;;
     unload)             cmd_unload             ;;
-    install-sys-configs) cmd_install_sys_configs ;;
-    install-deps)        cmd_install_deps       ;;
-    setup-swap)          cmd_setup_swap "$@"    ;;
+    install-sys-configs)   cmd_install_sys_configs   ;;
+    install-llama-configs) cmd_install_llama_configs ;;
+    install-deps)          cmd_install_deps          ;;
     full-install)        cmd_full_install "$@"  ;;
     tune)               cmd_tune               ;;
     tune-grub)          cmd_tune_grub          ;;

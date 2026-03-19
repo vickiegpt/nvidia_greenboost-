@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GreenBoost v2.3 — Setup & installation script
+# GreenBoost v2.4 — Setup & installation script
 # Author: Ferran Duarri
 # Hardware: ASRock B760M-ITX/D4 | i9-14900KF | RTX 5070 OC | 64 GB DDR4-3600 | Samsung 990 EVO Plus 4 TB
 #
@@ -14,7 +14,7 @@
 #   sudo ./greenboost_setup.sh uninstall        — remove module + all config
 #   sudo ./greenboost_setup.sh load             — insmod with default params
 #   sudo ./greenboost_setup.sh unload           — rmmod
-#   sudo ./greenboost_setup.sh install-sys-configs — install v2.3 system config files
+#   sudo ./greenboost_setup.sh install-sys-configs — install v2.4 system config files
 #   sudo ./greenboost_setup.sh tune             — runtime tuning (governor, NVMe, sysctl)
 #   sudo ./greenboost_setup.sh tune-grub        — GRUB/boot parameter optimization
 #   sudo ./greenboost_setup.sh tune-sysctl      — consolidate + enhance sysctl (persistent)
@@ -232,7 +232,7 @@ cmd_install_sys_configs() {
     need_root install-sys-configs
     detect_hardware
 
-    info "Installing GreenBoost v2.3 system configuration files..."
+    info "Installing GreenBoost v2.4 system configuration files..."
 
     # 1. Ollama service — inject GreenBoost env vars + LD_PRELOAD
     local svc="/etc/systemd/system/ollama.service"
@@ -265,7 +265,7 @@ UDEVEOF
 
     # 2b. NVMe udev rule — scheduler=none, read_ahead=4096, nr_requests=2048
     cat > /etc/udev/rules.d/99-nvme-greenboost.rules << 'UDEVEOF'
-# GreenBoost v2.3 — NVMe tuning for T3 swap performance
+# GreenBoost v2.4 — NVMe tuning for T3 swap performance
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/scheduler}="none"
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/read_ahead_kb}="4096"
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/nr_requests}="2048"
@@ -299,7 +299,7 @@ CPUEOF
     # which triggers the OOM guard and makes T2 unavailable.  Keep nr_hugepages=0.
     mkdir -p /etc/sysfs.d
     cat > /etc/sysfs.d/greenboost-hugepages.conf << 'HPEOF'
-# GreenBoost v2.3 — THP config (no HugeTLB pre-allocation: gb_alloc_buf uses buddy allocator)
+# GreenBoost v2.4 — THP config (no HugeTLB pre-allocation: gb_alloc_buf uses buddy allocator)
 kernel/mm/transparent_hugepage/enabled = always
 HPEOF
     info "THP sysfs conf: /etc/sysfs.d/greenboost-hugepages.conf"
@@ -315,7 +315,7 @@ HPEOF
 
     # 5. VM sysctl — reduce swap pressure, tune write-back
     cat > /etc/sysctl.d/99-greenboost.conf << 'SYSCTLEOF'
-# GreenBoost v2.3 — VM tuning for 3-tier model pool
+# GreenBoost v2.4 — VM tuning for 3-tier model pool
 vm.swappiness = 5
 vm.dirty_ratio = 20
 vm.dirty_background_ratio = 5
@@ -329,7 +329,7 @@ SYSCTLEOF
 }
 
 cmd_build() {
-    info "Building GreenBoost v2.3 (3-tier: VRAM + DDR4 + NVMe)..."
+    info "Building GreenBoost v2.4 (3-tier: VRAM + DDR4 + NVMe)..."
     make -C "$MODULE_DIR" all || die "Build failed — check output above"
     info "Build complete:"
     info "  Kernel module : $MODULE_DIR/greenboost.ko"
@@ -361,7 +361,7 @@ MODEOF
 
     # profile.d helper
     cat > /etc/profile.d/greenboost.sh << PROFEOF
-# GreenBoost v2.3 — shell helpers
+# GreenBoost v2.4 — shell helpers
 export GREENBOOST_SHIM="$SHIM_DEST/$SHIM_LIB"
 greenboost-run() { LD_PRELOAD="\$GREENBOOST_SHIM" "\$@"; }
 export -f greenboost-run
@@ -415,7 +415,7 @@ cmd_load() {
         pcores_only="$pcores_only" \
         || die "insmod failed — check: dmesg | tail -20"
 
-    info "GreenBoost v2.3 loaded — 3-tier pool active!"
+    info "GreenBoost v2.4 loaded — 3-tier pool active!"
     info ""
     info "  T1 RTX 5070 VRAM : ${phys} GB   ~336 GB/s  [hot layers]"
     info "  T2 DDR4 pool     : ${virt} GB    ~50 GB/s  [cold layers]"
@@ -704,7 +704,7 @@ cmd_tune_sysctl() {
     echo ""
 
     cat > "$dest" << 'SYSCTL_EOF'
-# GreenBoost v2.3 — Definitive sysctl config
+# GreenBoost v2.4 — Definitive sysctl config
 # Hardware: i9-14900KF | RTX 5070 | 64 GB DDR4-3600 | Samsung 990 EVO Plus 4 TB
 # Loaded last (99-zzz) — wins all conflicts with earlier sysctl.d files.
 # Do NOT edit other sysctl.d files; make changes here instead.
@@ -913,7 +913,7 @@ cmd_tune_libs() {
 
 cmd_tune_all() {
     need_root tune-all
-    info "Running full system tuning for GreenBoost v2.3..."
+    info "Running full system tuning for GreenBoost v2.4..."
     echo ""
     cmd_tune
     echo ""
@@ -929,7 +929,7 @@ cmd_tune_all() {
 
 cmd_status() {
     echo ""
-    echo -e "${BLU}=== GreenBoost v2.3 Status (3-tier pool) ===${NC}"
+    echo -e "${BLU}=== GreenBoost v2.4 Status (3-tier pool) ===${NC}"
     echo ""
 
     if lsmod | grep -q "^${DRIVER_NAME} "; then
@@ -952,7 +952,7 @@ cmd_status() {
 
 cmd_help() {
     echo ""
-    echo -e "${BLU}GreenBoost v2.3 — 3-Tier GPU Memory Pool${NC}"
+    echo -e "${BLU}GreenBoost v2.4 — 3-Tier GPU Memory Pool${NC}"
     echo "Author : Ferran Duarri"
     echo "Target : ASUS RTX 5070 12 GB + 64 GB DDR4-3600 + 4 TB Samsung 990 Evo Plus NVMe"
     echo ""
@@ -1012,11 +1012,11 @@ cmd_help() {
 }
 
 # ---- install-deps ------------------------------------------------------
-# Install all Rocky packages needed for GreenBoost v2.3 + ExLlamaV3
+# Install all Rocky packages needed for GreenBoost v2.4 + ExLlamaV3
 
 cmd_install_deps() {
     need_root install-deps
-    info "Installing Rocky dependencies for GreenBoost v2.3 + ExLlamaV3..."
+    info "Installing Rocky dependencies for GreenBoost v2.4 + ExLlamaV3..."
     info "Running dnf update..."
     dnf update -qq
 
@@ -1610,7 +1610,7 @@ cmd_diagnose() {
 
     # Log header
     {
-        echo "=== GreenBoost v2.3 Diagnose Log ==="
+        echo "=== GreenBoost v2.4 Diagnose Log ==="
         echo "timestamp=$(date '+%Y-%m-%d %H:%M:%S')"
         echo "kernel=$(uname -r)"
         echo "host=$(hostname)"
@@ -1620,7 +1620,7 @@ cmd_diagnose() {
 
     echo ""
     echo -e "${BLU}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLU}║  GreenBoost v2.3 — Full Diagnostic + Model Benchmark        ║${NC}"
+    echo -e "${BLU}║  GreenBoost v2.4 — Full Diagnostic + Model Benchmark        ║${NC}"
     echo -e "${BLU}╚══════════════════════════════════════════════════════════════╝${NC}"
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -1705,13 +1705,13 @@ cmd_diagnose() {
         elif echo "$shim_out" | grep -q "UVM overflow.*unavailable"; then
             _warn "Shim init: UVM overflow unavailable — load nvidia_uvm"
         fi
-        # Check dlsym hook present (v2.3+) — required to intercept dlopen+dlsym GPU API calls
+        # Check dlsym hook present (v2.4+) — required to intercept dlopen+dlsym GPU API calls
         if strings "$shim" 2>/dev/null | grep -q "dlsym hook"; then
             _chk "dlsym hook present (intercepts Ollama dlopen+dlsym GPU API calls)"
         else
             _fail "dlsym hook MISSING — Ollama NVML/CUDA discovery sees only physical VRAM"
             _info "Rebuild shim: cd $MODULE_DIR && make shim && sudo ./deploy_fix.sh"
-            _rec "Rebuild shim v2.3: cd $MODULE_DIR && make shim && sudo ./deploy_fix.sh"
+            _rec "Rebuild shim v2.4: cd $MODULE_DIR && make shim && sudo ./deploy_fix.sh"
         fi
     fi
 

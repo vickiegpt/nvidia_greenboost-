@@ -140,8 +140,18 @@ sudo ./greenboost_setup.sh full-install
 sudo ./greenboost_setup.sh diagnose
 ```
 
-The installer builds the kernel module and shim, sets up the NVMe swap file, configures
-Ollama's systemd environment, and applies sysctl tuning for PCIe and memory performance.
+The installer runs the following steps automatically:
+
+| Step | What it does |
+|------|-------------|
+| Purge | Stops Ollama/llama-server, unloads any previous GreenBoost module, removes old install artifacts |
+| Dependencies | Installs build tools, kernel headers, CUDA dev packages |
+| Build + install | Compiles `greenboost.ko` + `libgreenboost_cuda.so`, installs to `/lib/modules` and `/usr/local/lib` |
+| Load | Inserts the kernel module with auto-detected pool sizes (T1/T2/T3) |
+| System configs | Writes Ollama systemd env vars, NVMe udev rules, CPU governor service, hugepages, sysctl |
+| **tune-all** | **CPU governor → performance; NVMe scheduler → none, read-ahead → 4 MB; THP → always; vm.swappiness=10; GRUB params (rcu_nocbs, nohz_full, transparent_hugepage=always); AI/compute libraries (OpenBLAS AVX2, hwloc, libnuma, nvtop, microcode)** |
+| ExLlamaV3 | Sets up `/opt/greenboost/venv` with ExLlamaV3 + kvpress + trl |
+| Restart | Restarts any services that were stopped during purge (Ollama, llama-server) |
 
 ---
 
@@ -169,19 +179,68 @@ watch -n1 'cat /sys/class/greenboost/greenboost/pool_info'
 
 ---
 
+## Using GreenBoost with inference tools
+
+The CUDA shim uses a two-stage activation approach that is safe system-wide:
+
+- **Stage 1 (automatic):** At load time the shim silently probes whether `libcuda.so.1`
+  is already resident in the process (`RTLD_NOLOAD` — zero side-effects). Apps that link
+  CUDA statically (llama.cpp, TensorRT-LLM) activate the shim automatically. Processes
+  without CUDA (GDM, shells, systemd helpers) are completely unaffected.
+- **Stage 2 (explicit opt-in):** Apps that load CUDA lazily via `dlopen` at runtime
+  (Ollama, vLLM, PyTorch) need `GREENBOOST_ACTIVE=1` set in their environment so the
+  shim loads `libcuda.so.1` proactively before the app does.
+
+| Method | When to use |
+|--------|-------------|
+| `/etc/ld.so.preload` (configured by installer) | All processes — Stage 1 auto-detects CUDA, safe for GDM and system services |
+| `greenboost-run <cmd>` | CLI tools that load CUDA lazily — sets `GREENBOOST_ACTIVE=1` automatically |
+| `Environment="GREENBOOST_ACTIVE=1"` + `LD_PRELOAD` in `[Service]` | systemd services (Ollama, llama-server — configured automatically by the installer) |
+
+**Quick examples:**
+
+```bash
+# Ollama — configured automatically by full-install (restart service after install)
+sudo systemctl restart ollama
+ollama run glm-4.7-flash:q8_0
+
+# llama.cpp / ik_llama.cpp (static CUDA link — activates automatically via ld.so.preload)
+./build/bin/llama-cli -m model.gguf --n-gpu-layers 999 --ctx-size 131072
+
+# vLLM
+greenboost-run python -m vllm.entrypoints.openai.api_server \
+  --model /path/to/model --gpu-memory-utilization 0.95
+
+# LM Studio, Jan.ai, ComfyUI, SD WebUI, koboldcpp
+greenboost-run /path/to/app
+
+# HuggingFace Transformers
+greenboost-run python your_script.py
+```
+
+For full per-tool instructions, GPU layer flags, ExLlamaV2/V3 specifics, and the
+complete list of environment variables see
+**[implementing_further_into_tools.md](implementing_further_into_tools.md)**.
+
+---
+
 ## Observed performance (glm-4.7-flash:q8_0, RTX 5070)
 
 | Setup | Decode tok/s | TTFT |
 |-------|-------------|------|
-| Ollama + GreenBoost shim (baseline) | 2–5 | 5–15s |
+| Ollama + GreenBoost shim (UVM path) | 3–8 | 4–12s |
 | + kvpress 50% KV compression | 4–8 | 3–10s |
 | ExLlamaV3 + GreenBoost cache | 8–20 | 2–8s |
 | ModelOpt FP8 (16 GB model) | 10–25 | 1–5s |
 | ExLlamaV3 EXL3 2bpw (8 GB, full VRAM) | 25–60 | 0.5–2s |
 
-The PCIe 4.0 link (~32 GB/s) is the bottleneck when the model overflows VRAM. The best
-strategy is to shrink the model until it fits — either with EXL3 quantization or ModelOpt
-PTQ — and use GreenBoost's DDR4 pool for KV cache only.
+The UVM overflow path benefits from `cuMemAdvise` prefetch hints applied at allocation
+time — these switch the UVM driver from on-demand page-fault mode to direct PTE mapping,
+eliminating 5–50 µs per-access fault latency and yielding ~50% throughput improvement on
+the PCIe overflow path. Even so, the PCIe 4.0 link (~32 GB/s) remains the hard bottleneck
+when the model overflows VRAM. The best strategy is to shrink the model until it fits —
+either with EXL3 quantization or ModelOpt PTQ — and use GreenBoost's DDR4 pool for KV
+cache only.
 
 ---
 
@@ -229,7 +288,7 @@ COMMANDS:
   install-sys-configs  Install Ollama env, NVMe udev, CPU governor, hugepages, sysctl
   install-deps         Install all Ubuntu OS packages (build + CUDA + AI libs)
   setup-swap [GB]      Create/activate NVMe swap (default: auto-sized, ~64 GB for target model)
-  full-install [--owner-workstation]  Complete install — hardware auto-detected or owner preset
+  full-install   Complete install — deps, module, shim, configs, tune-all, ExLlamaV3
   status      Show module status and 3-tier pool info
   diagnose    Full health check — run this after reboot to verify everything works
   optimize-model [--model M] [--strategy tensorrt|lora|exllama|all]
@@ -263,3 +322,9 @@ or different inference engines beyond Ollama and ExLlamaV3.
 
 - **Alan Sill** ([@alansill](https://gitlab.com/alansill)) — contributed `greenboost_setup_rocky.sh`,
   a setup script for Red Hat-based systems (Rocky Linux, AlmaLinux, RHEL).
+
+
+## Non direct Contributors
+v2.4 include those changes;
+   
+CUDA shim safety fix: https://github.com/Project-HAMi/HAMi-core 

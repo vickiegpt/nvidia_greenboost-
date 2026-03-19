@@ -1,4 +1,4 @@
-# GreenBoost v2.3 — Kernel module + CUDA shim build system
+# GreenBoost v2.4 — Kernel module + CUDA shim build system
 # Author: Ferran Duarri
 # 3-tier: RTX 5070 12 GB VRAM | 51 GB DDR4 pool | 576 GB NVMe swap = 639 GB
 
@@ -25,7 +25,7 @@ module:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 shim: greenboost_cuda_shim.c greenboost_cuda.map
-	$(CC) -shared -fPIC -O2 -o $(SHIM) greenboost_cuda_shim.c -ldl -lpthread \
+	$(CC) -shared -fPIC -O2 -std=gnu11 -o $(SHIM) greenboost_cuda_shim.c -ldl -lpthread \
 		-Wl,--version-script=greenboost_cuda.map
 	@echo "[GreenBoost] Built $(SHIM)"
 
