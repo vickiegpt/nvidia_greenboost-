@@ -50,6 +50,36 @@
 #include <asm/processor.h>        /* boot_cpu_data.x86_model_id       */
 #include "greenboost_ioctl.h"
 
+#include <linux/version.h>
+
+/* ------------------------------------------------------------------ */
+/*  Kernel version compatibility shims (5.15 <-> 6.x)                */
+/* ------------------------------------------------------------------ */
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
+/* iosys_map was called dma_buf_map before 5.18 */
+#include <linux/dma-buf-map.h>
+#define iosys_map                dma_buf_map
+#define iosys_map_set_vaddr      dma_buf_map_set_vaddr
+#define iosys_map_clear          dma_buf_map_clear
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+/* class_create() lost the owner parameter in 6.4 */
+#undef class_create
+#define class_create(name)       __class_create(THIS_MODULE, name, NULL)
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
+/* pin_user_pages() dropped the vmas parameter in 6.5 */
+#define pin_user_pages(s, n, f, p) pin_user_pages(s, n, f, p, NULL)
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
+/* eventfd_signal() dropped the count parameter in 6.8 */
+#define eventfd_signal(ctx)      eventfd_signal(ctx, 1)
+#endif
+
 // Needed for Red Hat 5.14 and 5.16+ kernels
 // See for example https://github.com/google/gasket-driver/issues/14
 #if __has_include(<linux/dma-buf.h>)

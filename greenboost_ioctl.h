@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Copyright (C) 2024-2026 Ferran Duarri. Dual-licensed: GPL v2 + Commercial.
- * GreenBoost v2.4 — Shared IOCTL definitions (kernel + userspace)
+ * GreenBoost v2.5 — Shared IOCTL definitions (kernel + userspace)
  *
  * Works with both #include <linux/ioctl.h> (kernel) and <sys/ioctl.h> (user).
  *
@@ -31,6 +31,11 @@
 #define GB_ALLOC_FROZEN      (1u << 3)  /* never evict from T2              */
 #define GB_ALLOC_NO_HUGEPAGE (1u << 4)  /* force 4K (for T3-spillable)      */
 
+/* Tier identifiers (for CXL migration IOCTL) */
+#define GB_TIER2  2
+#define GB_TIER3  3
+#define GB_TIER4  4
+
 /* Allocate a pinned system RAM buffer; returns a DMA-BUF fd the GPU can import */
 struct gb_alloc_req {
 	gb_u64 size;    /* bytes to allocate          (in)  */
@@ -38,7 +43,7 @@ struct gb_alloc_req {
 	gb_u32 flags;   /* GB_ALLOC_* flags           (in)  */
 };
 
-/* Pool statistics — three-tier memory hierarchy */
+/* Pool statistics — four-tier memory hierarchy */
 struct gb_info {
 	/* Tier 1 — GPU VRAM (physical, managed by NVIDIA driver) */
 	gb_u64 vram_physical_mb;   /* RTX 5070 physical VRAM             */
@@ -61,8 +66,15 @@ struct gb_info {
 	gb_u32 swap_pressure;      /* 0=ok 1=warn(>75%) 2=critical(>90%) */
 	gb_u32 _pad;               /* alignment                          */
 
+	/* Tier 4 — CXL remote memory (DMA-accelerated) */
+	gb_u64 cxl_total_mb;       /* configured CXL pool capacity       */
+	gb_u64 cxl_allocated_mb;   /* bytes currently allocated in T4    */
+	gb_u64 cxl_available_mb;   /* cxl_total - cxl_allocated          */
+	gb_u32 cxl_numa_node;      /* NUMA node id for CXL memory        */
+	gb_u32 _pad2;              /* alignment                          */
+
 	/* Combined view */
-	gb_u64 total_combined_mb;  /* VRAM + DDR4 pool + NVMe swap       */
+	gb_u64 total_combined_mb;  /* VRAM + DDR4 pool + NVMe swap + CXL */
 };
 
 /* Madvise request — advise the kernel on buffer eviction priority */
@@ -80,10 +92,7 @@ struct gb_evict_req {
 	gb_u32 _pad;
 };
 
-/* Poll-fd request — register a userspace eventfd to receive pressure events.
- * Userspace creates the eventfd: efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)
- * then passes it here.  Kernel signals it whenever swap pressure changes.
- */
+/* Poll-fd request — register a userspace eventfd to receive pressure events. */
 struct gb_poll_req {
 	gb_s32 efd;     /* eventfd fd (in — created by caller)         */
 	gb_u32 _pad;
@@ -97,6 +106,12 @@ struct gb_pin_req {
 	gb_u32 flags;   /* GB_ALLOC_* flags   (in)    */
 };
 
+/* CXL migration request — migrate buffer between T2 (DDR) and T4 (CXL) */
+struct gb_cxl_migrate_req {
+	gb_s32 buf_id;       /* IDR buffer id              (in) */
+	gb_u32 target_tier;  /* GB_TIER2 or GB_TIER4       (in) */
+};
+
 #define GB_IOCTL_MAGIC      'G'
 #define GB_IOCTL_ALLOC      _IOWR(GB_IOCTL_MAGIC, 1, struct gb_alloc_req)
 #define GB_IOCTL_GET_INFO   _IOR( GB_IOCTL_MAGIC, 2, struct gb_info)
@@ -105,6 +120,7 @@ struct gb_pin_req {
 #define GB_IOCTL_EVICT      _IOW( GB_IOCTL_MAGIC, 5, struct gb_evict_req)
 #define GB_IOCTL_POLL_FD    _IOW( GB_IOCTL_MAGIC, 7, struct gb_poll_req)
 #define GB_IOCTL_PIN_USER_PTR _IOWR(GB_IOCTL_MAGIC, 8, struct gb_pin_req)
+#define GB_IOCTL_CXL_MIGRATE  _IOW(GB_IOCTL_MAGIC, 9, struct gb_cxl_migrate_req)
 
 /* Swap pressure thresholds */
 #define GB_SWAP_PRESSURE_OK       0

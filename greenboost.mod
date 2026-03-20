@@ -1,1 +1,2 @@
-./greenboost.o
+/home/ubuntu/nvidia_greenboost/greenboost.o
+
